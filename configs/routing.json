@@ -1,7 +1,18 @@
 {
   "security_keywords": ["password", "credential", "security", "breach"],
+
   "required_fields": ["urgency"],
   "clarification_question": "How urgent is this? (low / medium / high)",
   "default_queue": "IT",
-  "default_route": "CREATE_DRAFT_TICKET"
+  "default_route": "CREATE_DRAFT_TICKET",
+
+  "source_policies": {
+    "barcode_scan": {
+      "required_fields": [
+        "payload.barcode"
+      ],
+      "clarification_question": "Missing barcode. Please rescan the product barcode.",
+      "default_route": "NORMALIZE_BARCODE"
+    }
+  }
 }
