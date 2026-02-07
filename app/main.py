@@ -1,12 +1,18 @@
 from datetime import datetime
 import uuid
+from typing import Optional
 
 from fastapi import FastAPI, Header, HTTPException, Depends
 
 from app.core.auth import require_ops_api_key
 from app.core.idempotency_store import SQLiteIdempotencyStore
 from app.core.logging import get_logger, log_event
-from app.domain.schemas import IngestRequest, IngestResponse, Event
+from app.domain.schemas import (
+    IngestRequest,
+    IngestResponse,
+    Event,
+    BarcodeScanIngestRequest,
+)
 from app.services.router import route_event
 from app.services.actuator import execute_decision
 
@@ -17,7 +23,7 @@ logger = get_logger()
 idem_store = SQLiteIdempotencyStore()
 
 
-def _process_ingest(ingest_req: IngestRequest, idempotency_key: str | None) -> IngestResponse:
+def _process_ingest(ingest_req: IngestRequest, idempotency_key: Optional[str]) -> IngestResponse:
     """
     Canonical ingest pipeline runner:
       - enforce idempotency key
@@ -185,6 +191,48 @@ def ops_ping(_: None = Depends(require_ops_api_key)):
 @app.post("/ingest/api", response_model=IngestResponse)
 def ingest_api(
     req: IngestRequest,
-    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
 ) -> IngestResponse:
     return _process_ingest(req, idempotency_key)
+
+
+@app.post("/ingest/barcode_scan", response_model=IngestResponse)
+def ingest_barcode_scan(
+    req: BarcodeScanIngestRequest,
+    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
+) -> IngestResponse:
+    """
+    Mobile barcode scan ingest.
+
+    Idempotency (frontend-aware):
+    - Prefer Idempotency-Key header if the client provides it.
+    - Else derive a stable key from (device_id + scan_session_id + barcode) if available.
+    - Else reject (forces frontend to provide stable retry identity).
+    """
+    effective_key = idempotency_key
+    if not effective_key:
+        if req.device_id and req.scan_session_id:
+            effective_key = f"scan:{req.device_id}:{req.scan_session_id}:{req.barcode}"
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail="Missing Idempotency-Key (provide header or device_id+scan_session_id)",
+            )
+
+    ingest_req = IngestRequest(
+        source="barcode_scan",
+        event_type="barcode_scan",
+        actor=req.device_id,
+        payload={
+            "barcode": req.barcode,
+            "symbology": req.symbology,
+            "device_id": req.device_id,
+            "scan_session_id": req.scan_session_id,
+            "app_version": req.app_version,
+            "locale": req.locale,
+        },
+        metadata=req.metadata,
+    )
+
+    return _process_ingest(ingest_req, effective_key)
+ 

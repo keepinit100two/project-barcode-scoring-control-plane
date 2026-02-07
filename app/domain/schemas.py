@@ -102,3 +102,13 @@ class ActionResult(BaseModel):
         None,
         description="Human-readable guidance for operator or caller",
     )
+
+
+class BarcodeScanIngestRequest(BaseModel):
+    barcode: str = Field(..., description="UPC/EAN code scanned by the user (digits only recommended)")
+    symbology: Optional[str] = Field(None, description="Optional symbology hint: UPC-A, EAN-13, etc.")
+    device_id: Optional[str] = Field(None, description="Stable device identifier (if available)")
+    scan_session_id: Optional[str] = Field(None, description="Client-generated scan session id (if available)")
+    app_version: Optional[str] = Field(None, description="Mobile app version")
+    locale: Optional[str] = Field(None, description="Locale, e.g. en-US")
+    metadata: Dict[str, Any] = Field(default_factory=dict, description="Additional client context")
