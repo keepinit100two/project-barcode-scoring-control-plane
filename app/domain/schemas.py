@@ -106,3 +106,30 @@ class ProductNormalizationResult(BaseModel):
     brand: Optional[str] = None
     ingredients_raw: str
     ingredients: List[NormalizedIngredient] = Field(default_factory=list)
+    
+class IngredientRubricEnrichment(BaseModel):
+    ingredient_name: str = Field(..., description="Ingredient name as seen on label")
+    suggested_canonical_name: Optional[str] = Field(None, description="AI-suggested canonical name (not an ID)")
+    category: Optional[str] = Field(None, description="preservative | fragrance | sweetener | etc.")
+    hormone_impact: Optional[str] = Field(None, description="none | low | medium | high")
+    safety_flags: List[str] = Field(default_factory=list, description="Reason-code flags for UI/scoring rules")
+    confidence: float = Field(..., ge=0.0, le=1.0, description="0..1 confidence")
+    notes: Optional[str] = Field(None, description="Short explanation")
+
+
+class AIEnrichmentResult(BaseModel):
+    schema_version: str = Field("ai_enrichment_v0")
+    event_id: str = Field(..., description="Event ID")
+    barcode: str = Field(..., description="Barcode")
+    unknown_ingredients: List[str] = Field(default_factory=list)
+    enrichments: List[IngredientRubricEnrichment] = Field(default_factory=list)
+
+    model: Optional[str] = None
+    status: str = Field(..., description="accepted | rejected | failed")
+    error: Optional[str] = None
+    
+class OpsEventActionRequest(BaseModel):
+    idempotency_key: str = Field(..., description="Idempotency key of an already-ingested event")
+    mode: Optional[str] = Field(None, description="Optional action mode (project-defined)")
+
+

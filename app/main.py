@@ -12,6 +12,8 @@ from app.domain.schemas import (
     IngestResponse,
     Event,
     BarcodeScanIngestRequest,
+    OpsEventActionRequest,  # ✅ generic ops request
+    Decision,
 )
 from app.services.router import route_event
 from app.services.actuator import execute_decision
@@ -24,15 +26,6 @@ idem_store = SQLiteIdempotencyStore()
 
 
 def _process_ingest(ingest_req: IngestRequest, idempotency_key: Optional[str]) -> IngestResponse:
-    """
-    Canonical ingest pipeline runner:
-      - enforce idempotency key
-      - reuse or create Event (persistent)
-      - Decide (router)
-      - Act v0 (safe execution)
-      - structured logging
-      - returns {event, decision}
-    """
     # Gate 1: Idempotency-Key is required
     if not idempotency_key:
         log_event(
@@ -60,7 +53,6 @@ def _process_ingest(ingest_req: IngestRequest, idempotency_key: Optional[str]) -
             },
         )
 
-        # Decide
         decision = route_event(existing_event)
         log_event(
             logger,
@@ -74,7 +66,6 @@ def _process_ingest(ingest_req: IngestRequest, idempotency_key: Optional[str]) -
             },
         )
 
-        # Act (safe execution)
         try:
             action_result = execute_decision(existing_event, decision)
             log_event(
@@ -104,7 +95,7 @@ def _process_ingest(ingest_req: IngestRequest, idempotency_key: Optional[str]) -
 
         return IngestResponse(event=existing_event, decision=decision)
 
-    # Create new canonical Event
+    # New Event
     event = Event(
         event_id=str(uuid.uuid4()),
         event_type=ingest_req.event_type,
@@ -126,7 +117,7 @@ def _process_ingest(ingest_req: IngestRequest, idempotency_key: Optional[str]) -
         },
     )
 
-    # Persist Event for idempotency (survives restart)
+    # Persist Event for idempotency
     idem_store.set(idempotency_key, event)
 
     # Decide
@@ -143,7 +134,7 @@ def _process_ingest(ingest_req: IngestRequest, idempotency_key: Optional[str]) -
         },
     )
 
-    # Act (safe execution)
+    # Act
     try:
         action_result = execute_decision(event, decision)
         log_event(
@@ -181,10 +172,6 @@ def health_check():
 
 @app.get("/ops/ping")
 def ops_ping(_: None = Depends(require_ops_api_key)):
-    """
-    Minimal protected ops endpoint.
-    Requires header: X-API-Key: <OPS_API_KEY>
-    """
     return {"status": "ok"}
 
 
@@ -205,9 +192,9 @@ def ingest_barcode_scan(
     Mobile barcode scan ingest.
 
     Idempotency (frontend-aware):
-    - Prefer Idempotency-Key header if the client provides it.
-    - Else derive a stable key from (device_id + scan_session_id + barcode) if available.
-    - Else reject (forces frontend to provide stable retry identity).
+    - Prefer Idempotency-Key header if client provides it
+    - Else derive stable key from (device_id + scan_session_id + barcode)
+    - Else reject
     """
     effective_key = idempotency_key
     if not effective_key:
@@ -235,4 +222,62 @@ def ingest_barcode_scan(
     )
 
     return _process_ingest(ingest_req, effective_key)
- 
+
+
+@app.post("/ops/barcode/enrich_ai")
+def ops_barcode_enrich_ai(
+    req: OpsEventActionRequest,
+    _: None = Depends(require_ops_api_key),
+):
+    """
+    Operator-triggered Tier-2 enrichment phase.
+
+    Uses stored Event (via idempotency_key) and executes:
+      route = ENRICH_UNKNOWN_INGREDIENTS_AI
+    """
+    existing_event = idem_store.get(req.idempotency_key)
+    if not existing_event:
+        raise HTTPException(
+            status_code=404,
+            detail="Event not found for idempotency_key. Ingest must happen first.",
+        )
+
+    if existing_event.source != "barcode_scan":
+        raise HTTPException(
+            status_code=400,
+            detail="AI enrichment supported only for barcode_scan events.",
+        )
+
+    decision = Decision(
+        decision_id=str(uuid.uuid4()),
+        event_id=existing_event.event_id,
+        route="ENRICH_UNKNOWN_INGREDIENTS_AI",
+        reason="Operator triggered AI enrichment for unknown ingredients",
+        risk_level="medium",
+        proposed_action={},
+    )
+
+    log_event(
+        logger,
+        event_name="ops_ai_enrichment_requested",
+        fields={
+            "idempotency_key": req.idempotency_key,
+            "event_id": existing_event.event_id,
+            "mode": req.mode,
+        },
+    )
+
+    action_result = execute_decision(existing_event, decision)
+
+    log_event(
+        logger,
+        event_name="ops_ai_enrichment_completed",
+        fields={
+            "idempotency_key": req.idempotency_key,
+            "event_id": existing_event.event_id,
+            "status": action_result.status,
+            "artifact_path": action_result.artifact_path,
+        },
+    )
+
+    return {"event_id": existing_event.event_id, "action_result": action_result.model_dump()}
