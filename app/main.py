@@ -1,11 +1,15 @@
 from datetime import datetime
 import uuid
-from typing import Optional
+import json
+import os
+import sqlite3
+from pathlib import Path
+from typing import Optional, Tuple
 
 from fastapi import FastAPI, Header, HTTPException, Depends
 
 from app.core.auth import require_ops_api_key
-from app.core.idempotency_store import SQLiteIdempotencyStore
+from app.core.idempotency_store import SQLiteIdempotencyStore, DB_PATH  # DB_PATH used for barcode search
 from app.core.logging import get_logger, log_event
 from app.domain.schemas import (
     IngestRequest,
@@ -14,6 +18,10 @@ from app.domain.schemas import (
     BarcodeScanIngestRequest,
     OpsEventActionRequest,
     Decision,
+    ScoreApiResponse,
+    ScoreResult,
+    ProductNormalizationResult,
+    AIEnrichmentResult,
 )
 from app.services.router import route_event
 from app.services.actuator import execute_decision
@@ -22,6 +30,21 @@ app = FastAPI(title="AI Control Plane")
 logger = get_logger()
 
 idem_store = SQLiteIdempotencyStore()
+
+
+def _artifact_dir() -> Path:
+    """
+    Where artifacts are stored in local dev.
+    Tests can override via env var ARTIFACT_DIR.
+    """
+    return Path(os.environ.get("ARTIFACT_DIR", "artifacts/drafts")).resolve()
+
+
+def _read_artifact_json(filename: str) -> Optional[dict]:
+    path = _artifact_dir() / filename
+    if not path.exists():
+        return None
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
 def _process_ingest(ingest_req: IngestRequest, idempotency_key: Optional[str]) -> IngestResponse:
@@ -230,7 +253,7 @@ def ops_barcode_enrich_ai(
         proposed_action={},
     )
 
-    log_event(logger, "ops_ai_enrichment_requested", {"idempotency_key": req.idempotency_key, "event_id": existing_event.event_id, "mode": req.mode})
+    log_event(logger, "ops_ai_enrichment_requested", {"idempotency_key": req.idempotency_key, "event_id": existing_event.event_id})
     action_result = execute_decision(existing_event, decision)
     log_event(logger, "ops_ai_enrichment_completed", {"idempotency_key": req.idempotency_key, "event_id": existing_event.event_id, "status": action_result.status, "artifact_path": action_result.artifact_path})
 
@@ -242,10 +265,6 @@ def ops_barcode_score(
     req: OpsEventActionRequest,
     _: None = Depends(require_ops_api_key),
 ):
-    """
-    Operator-triggered deterministic scoring phase.
-    Reads normalization + (optional) enrichment artifacts and writes score_result artifact.
-    """
     existing_event = idem_store.get(req.idempotency_key)
     if not existing_event:
         raise HTTPException(status_code=404, detail="Event not found for idempotency_key. Ingest must happen first.")
@@ -262,8 +281,170 @@ def ops_barcode_score(
         proposed_action={},
     )
 
-    log_event(logger, "ops_score_requested", {"idempotency_key": req.idempotency_key, "event_id": existing_event.event_id, "mode": req.mode})
+    log_event(logger, "ops_score_requested", {"idempotency_key": req.idempotency_key, "event_id": existing_event.event_id})
     action_result = execute_decision(existing_event, decision)
     log_event(logger, "ops_score_completed", {"idempotency_key": req.idempotency_key, "event_id": existing_event.event_id, "status": action_result.status, "artifact_path": action_result.artifact_path})
 
     return {"event_id": existing_event.event_id, "action_result": action_result.model_dump()}
+
+
+def _find_latest_event_by_barcode(barcode: str) -> Optional[Tuple[str, Event]]:
+    """
+    Best-effort convenience: scan idempotency sqlite table to find the latest barcode_scan event for this barcode.
+    Returns (idempotency_key, Event) or None.
+    """
+    if not DB_PATH.exists():
+        return None
+
+    best: Optional[Tuple[str, Event]] = None
+    best_ts: Optional[str] = None
+
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute("SELECT key, event_json FROM idempotency").fetchall()
+
+    for key, event_json in rows:
+        try:
+            data = json.loads(event_json)
+        except Exception:
+            continue
+        try:
+            ev = Event.model_validate(data)
+        except Exception:
+            continue
+
+        if ev.source != "barcode_scan":
+            continue
+
+        bc = None
+        if isinstance(ev.payload, dict):
+            bc = ev.payload.get("barcode")
+
+        if str(bc) != str(barcode):
+            continue
+
+        ts = ev.timestamp.isoformat()
+        if best is None or (best_ts is not None and ts > best_ts) or best_ts is None:
+            best = (key, ev)
+            best_ts = ts
+
+    return best
+
+
+def _score_api_response_for_event(idempotency_key: str, ev: Event) -> ScoreApiResponse:
+    """
+    Determine current state and return a mobile-friendly response without re-running pipeline.
+    """
+    event_id = ev.event_id
+
+    norm_name = f"{event_id}.barcode_normalization.json"
+    enr_name = f"{event_id}.ingredient_enrichment_ai.json"
+    score_name = f"{event_id}.score_result.json"
+
+    norm_raw = _read_artifact_json(norm_name)
+    enr_raw = _read_artifact_json(enr_name)
+    score_raw = _read_artifact_json(score_name)
+
+    artifacts = {
+        "normalization": str(_artifact_dir() / norm_name) if norm_raw else None,
+        "enrichment": str(_artifact_dir() / enr_name) if enr_raw else None,
+        "score": str(_artifact_dir() / score_name) if score_raw else None,
+    }
+
+    # If score exists, we're complete
+    if score_raw:
+        score = ScoreResult.model_validate(score_raw)
+        return ScoreApiResponse(
+            status="complete",
+            idempotency_key=idempotency_key,
+            event_id=event_id,
+            barcode=(ev.payload.get("barcode") if isinstance(ev.payload, dict) else None),
+            score=score,
+            next_steps=None,
+            artifacts=artifacts,
+        )
+
+    # No normalization yet
+    if not norm_raw:
+        return ScoreApiResponse(
+            status="pending_normalization",
+            idempotency_key=idempotency_key,
+            event_id=event_id,
+            barcode=(ev.payload.get("barcode") if isinstance(ev.payload, dict) else None),
+            score=None,
+            next_steps="Run barcode scan ingest (normalization phase).",
+            artifacts=artifacts,
+        )
+
+    norm = ProductNormalizationResult.model_validate(norm_raw)
+    unknown = [i for i in norm.ingredients if i.ingredient_id is None or i.provenance == "unknown"]
+
+    # Needs enrichment if unknown exists and no accepted enrichment artifact
+    if unknown:
+        if not enr_raw:
+            return ScoreApiResponse(
+                status="pending_enrichment",
+                idempotency_key=idempotency_key,
+                event_id=event_id,
+                barcode=norm.barcode,
+                score=None,
+                next_steps="Trigger AI enrichment via /ops/barcode/enrich_ai.",
+                artifacts=artifacts,
+            )
+        try:
+            enr = AIEnrichmentResult.model_validate(enr_raw)
+            if enr.status != "accepted":
+                return ScoreApiResponse(
+                    status="pending_enrichment",
+                    idempotency_key=idempotency_key,
+                    event_id=event_id,
+                    barcode=norm.barcode,
+                    score=None,
+                    next_steps="AI enrichment was not accepted. Retry /ops/barcode/enrich_ai or proceed with conservative scoring.",
+                    artifacts=artifacts,
+                )
+        except Exception:
+            return ScoreApiResponse(
+                status="pending_enrichment",
+                idempotency_key=idempotency_key,
+                event_id=event_id,
+                barcode=norm.barcode,
+                score=None,
+                next_steps="AI enrichment artifact invalid. Retry enrichment.",
+                artifacts=artifacts,
+            )
+
+    # Normalized (and either no unknowns OR enrichment accepted) but score missing
+    return ScoreApiResponse(
+        status="pending_score",
+        idempotency_key=idempotency_key,
+        event_id=event_id,
+        barcode=norm.barcode,
+        score=None,
+        next_steps="Trigger scoring via /ops/barcode/score.",
+        artifacts=artifacts,
+    )
+
+
+@app.get("/score/by_idempotency/{idempotency_key}", response_model=ScoreApiResponse)
+def get_score_by_idempotency(idempotency_key: str) -> ScoreApiResponse:
+    ev = idem_store.get(idempotency_key)
+    if not ev:
+        raise HTTPException(status_code=404, detail="Event not found for idempotency_key")
+    return _score_api_response_for_event(idempotency_key, ev)
+
+
+@app.get("/score/by_barcode/{barcode}", response_model=ScoreApiResponse)
+def get_score_by_barcode(barcode: str) -> ScoreApiResponse:
+    found = _find_latest_event_by_barcode(barcode)
+    if not found:
+        return ScoreApiResponse(
+            status="error",
+            idempotency_key=None,
+            event_id=None,
+            barcode=barcode,
+            score=None,
+            next_steps="No scan event found for this barcode. Scan the product first.",
+            artifacts={},
+        )
+    idem_key, ev = found
+    return _score_api_response_for_event(idem_key, ev)

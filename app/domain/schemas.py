@@ -155,3 +155,25 @@ class ScoreResult(BaseModel):
 
     contributions: List[IngredientScoreContribution] = Field(default_factory=list)
     notes: Optional[str] = None
+
+class ScoreApiResponse(BaseModel):
+    """
+    Mobile-facing score API response.
+
+    The UI should treat this as a state machine:
+      - pending_normalization
+      - pending_enrichment
+      - pending_score
+      - complete
+      - error
+    """
+    status: str = Field(..., description="pending_normalization | pending_enrichment | pending_score | complete | error")
+    idempotency_key: Optional[str] = None
+    event_id: Optional[str] = None
+    barcode: Optional[str] = None
+
+    score: Optional[ScoreResult] = None
+
+    next_steps: Optional[str] = None
+    artifacts: Dict[str, Optional[str]] = Field(default_factory=dict, description="Paths to relevant artifacts (if present)")
+
