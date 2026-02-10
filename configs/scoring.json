@@ -1,0 +1,57 @@
+{
+  "schema_version": "scoring_v0",
+
+  "scales": {
+    "safety_score": { "min": 0, "max": 100, "start": 100 },
+    "hormone_score": { "min": 0, "max": 100, "start": 0 }
+  },
+
+  "hormone_impact_points": {
+    "none": 0,
+    "low": 10,
+    "medium": 25,
+    "high": 50
+  },
+
+  "flags_penalty": {
+    "endocrine_disruptor_suspected": { "safety": 15, "hormone": 35 },
+    "controversial_additive": { "safety": 8, "hormone": 5 }
+  },
+
+  "known_ingredient_rules": {
+    "ING_FRAGRANCE": {
+      "safety_penalty": 10,
+      "hormone_points": 20,
+      "notes": "Fragrance is a composite category; conservative hormone impact"
+    },
+    "ING_SODIUM_BICARB": {
+      "safety_penalty": 0,
+      "hormone_points": 0,
+      "notes": "Generally regarded as low concern"
+    },
+    "ING_ASCORBIC_ACID": {
+      "safety_penalty": 0,
+      "hormone_points": 0,
+      "notes": "Vitamin C; low concern"
+    },
+    "ING_WATER": {
+      "safety_penalty": 0,
+      "hormone_points": 0,
+      "notes": "Neutral"
+    }
+  },
+
+  "unknown_ingredient_policy": {
+    "if_ai_accepted_use_ai": true,
+    "if_ai_rejected_or_missing": {
+      "safety_penalty": 3,
+      "hormone_points": 5,
+      "notes": "Unknown ingredient without accepted enrichment gets conservative small penalty"
+    }
+  },
+
+  "rounding": {
+    "safety_score": "int",
+    "hormone_score": "int"
+  }
+}

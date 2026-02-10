@@ -4,19 +4,22 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from app.core.artifacts import LocalArtifactStore
-from app.domain.schemas import Event, Decision, ActionResult, AIEnrichmentResult
+from app.domain.schemas import (
+    Event,
+    Decision,
+    ActionResult,
+    AIEnrichmentResult,
+    ProductNormalizationResult,
+)
 from app.services.barcode_normalizer import normalize_barcode
 from app.services.llm_enrichment_client import call_mock_llm_enrichment
+from app.services.scoring_engine import score_product
 
 DEFAULT_DRAFT_DIR = Path(__file__).resolve().parents[2] / "artifacts" / "drafts"
 artifact_store = LocalArtifactStore(DEFAULT_DRAFT_DIR)
 
 
-def _read_json_from_artifacts(relative_path: str) -> Optional[Dict[str, Any]]:
-    """
-    LocalArtifactStore writes to base_dir/relative_path.
-    We read deterministically from that same base_dir.
-    """
+def _read_json(relative_path: str) -> Optional[Dict[str, Any]]:
     base_dir = getattr(artifact_store, "base_dir", DEFAULT_DRAFT_DIR)
     path = Path(base_dir) / relative_path
     if not path.exists():
@@ -44,8 +47,8 @@ def execute_decision(event: Event, decision: Decision) -> ActionResult:
             )
 
         result = normalize_barcode(str(barcode))
-        relative_path = f"{event.event_id}.barcode_normalization.json"
-        artifact_path = artifact_store.write_json(relative_path, result.model_dump())
+        rel = f"{event.event_id}.barcode_normalization.json"
+        artifact_path = artifact_store.write_json(rel, result.model_dump())
 
         return ActionResult(
             action_id=action_id,
@@ -59,10 +62,9 @@ def execute_decision(event: Event, decision: Decision) -> ActionResult:
 
     # Stage B: AI enrichment for unknown ingredients ONLY
     if decision.route == "ENRICH_UNKNOWN_INGREDIENTS_AI":
-        # Read prior normalization artifact
         norm_rel = f"{event.event_id}.barcode_normalization.json"
-        norm = _read_json_from_artifacts(norm_rel)
-        if not norm:
+        norm_raw = _read_json(norm_rel)
+        if not norm_raw:
             return ActionResult(
                 action_id=action_id,
                 event_id=event.event_id,
@@ -75,19 +77,14 @@ def execute_decision(event: Event, decision: Decision) -> ActionResult:
                 next_steps="Run barcode normalization before AI enrichment.",
             )
 
-        barcode = norm.get("barcode", "")
-        ingredients = norm.get("ingredients", [])
-        unknown = []
-        for ing in ingredients:
-            # unknown if no canonical id or explicit provenance unknown
-            if (ing.get("ingredient_id") is None) or (ing.get("provenance") == "unknown"):
-                unknown.append(ing.get("name"))
+        normalization = ProductNormalizationResult.model_validate(norm_raw)
+        barcode = normalization.barcode
 
-        unknown = [u for u in unknown if isinstance(u, str) and u.strip()]
+        unknown = [ing.name for ing in normalization.ingredients if ing.ingredient_id is None or ing.provenance == "unknown"]
 
-        # If no unknown ingredients, we still write an accepted empty result for audit
+        # Always write an artifact for audit, even if no unknown ingredients
         if not unknown:
-            result = AIEnrichmentResult(
+            empty = AIEnrichmentResult(
                 event_id=event.event_id,
                 barcode=barcode,
                 unknown_ingredients=[],
@@ -97,7 +94,7 @@ def execute_decision(event: Event, decision: Decision) -> ActionResult:
                 error=None,
             )
             rel = f"{event.event_id}.ingredient_enrichment_ai.json"
-            artifact_path = artifact_store.write_json(rel, result.model_dump())
+            artifact_path = artifact_store.write_json(rel, empty.model_dump())
             return ActionResult(
                 action_id=action_id,
                 event_id=event.event_id,
@@ -108,15 +105,14 @@ def execute_decision(event: Event, decision: Decision) -> ActionResult:
                 reason="No unknown ingredients; AI enrichment skipped",
             )
 
-        # Call mock LLM
+        # Call mock LLM (Tier-2)
         try:
             raw = call_mock_llm_enrichment(
                 event_id=event.event_id,
-                barcode=str(barcode),
+                barcode=barcode,
                 unknown_ingredients=unknown,
             )
         except Exception as e:
-            # Write failed artifact for audit
             rel = f"{event.event_id}.ingredient_enrichment_ai.json"
             artifact_path = artifact_store.write_json(
                 rel,
@@ -140,15 +136,12 @@ def execute_decision(event: Event, decision: Decision) -> ActionResult:
                 artifact_path=artifact_path,
                 reason="AI enrichment call failed",
                 error_code="AI_ENRICHMENT_FAILED",
-                next_steps="Retry enrichment or fall back to deterministic scoring without unknown ingredients.",
+                next_steps="Retry enrichment or score deterministically without unknown enrichment.",
             )
 
         # Strict schema validation
         try:
             validated = AIEnrichmentResult.model_validate(raw)
-            # Force status accepted if it validated and didn't declare otherwise
-            if validated.status not in ("accepted", "rejected", "failed"):
-                validated.status = "accepted"
             rel = f"{event.event_id}.ingredient_enrichment_ai.json"
             artifact_path = artifact_store.write_json(rel, validated.model_dump())
             return ActionResult(
@@ -161,7 +154,6 @@ def execute_decision(event: Event, decision: Decision) -> ActionResult:
                 reason="AI enrichment accepted and stored",
             )
         except Exception as e:
-            # Reject malformed output, but still write artifact for audit
             rel = f"{event.event_id}.ingredient_enrichment_ai.json"
             artifact_path = artifact_store.write_json(
                 rel,
@@ -186,13 +178,60 @@ def execute_decision(event: Event, decision: Decision) -> ActionResult:
                 artifact_path=artifact_path,
                 reason="AI enrichment output rejected (schema invalid)",
                 error_code="AI_SCHEMA_INVALID",
-                next_steps="Retry enrichment; if repeated failures, escalate to human review or ignore unknown ingredients.",
+                next_steps="Retry enrichment; if repeated, ignore unknown ingredients or escalate to manual review.",
             )
+
+    # Stage C: Deterministic scoring
+    if decision.route == "SCORE_PRODUCT":
+        norm_rel = f"{event.event_id}.barcode_normalization.json"
+        norm_raw = _read_json(norm_rel)
+        if not norm_raw:
+            return ActionResult(
+                action_id=action_id,
+                event_id=event.event_id,
+                decision_id=decision.decision_id,
+                action_type="score_product",
+                status="failed",
+                artifact_path=None,
+                reason="Normalization artifact not found; run NORMALIZE_BARCODE first",
+                error_code="MISSING_NORMALIZATION_ARTIFACT",
+                next_steps="Run barcode normalization before scoring.",
+            )
+
+        normalization = ProductNormalizationResult.model_validate(norm_raw)
+
+        enr_rel = f"{event.event_id}.ingredient_enrichment_ai.json"
+        enr_raw = _read_json(enr_rel)
+        enrichment = None
+        if enr_raw:
+            try:
+                enrichment = AIEnrichmentResult.model_validate(enr_raw)
+            except Exception:
+                enrichment = None
+
+        score = score_product(
+            event_id=event.event_id,
+            normalization=normalization,
+            enrichment=enrichment,
+        )
+
+        rel = f"{event.event_id}.score_result.json"
+        artifact_path = artifact_store.write_json(rel, score.model_dump())
+
+        return ActionResult(
+            action_id=action_id,
+            event_id=event.event_id,
+            decision_id=decision.decision_id,
+            action_type="score_product",
+            status="executed",
+            artifact_path=artifact_path,
+            reason="Deterministic scoring complete; score artifact written",
+        )
 
     # Legacy: draft ticket
     if decision.route == "CREATE_DRAFT_TICKET":
-        relative_path = f"{event.event_id}.draft_ticket.json"
-        draft_payload: Dict[str, Any] = {
+        rel = f"{event.event_id}.draft_ticket.json"
+        payload: Dict[str, Any] = {
             "event_id": event.event_id,
             "decision_id": decision.decision_id,
             "route": decision.route,
@@ -200,7 +239,7 @@ def execute_decision(event: Event, decision: Decision) -> ActionResult:
             "reason": decision.reason,
             "proposed_action": decision.proposed_action,
         }
-        artifact_path = artifact_store.write_json(relative_path, draft_payload)
+        artifact_path = artifact_store.write_json(rel, payload)
         return ActionResult(
             action_id=action_id,
             event_id=event.event_id,

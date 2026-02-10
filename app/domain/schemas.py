@@ -133,3 +133,25 @@ class OpsEventActionRequest(BaseModel):
     mode: Optional[str] = Field(None, description="Optional action mode (project-defined)")
 
 
+class IngredientScoreContribution(BaseModel):
+    ingredient_name: str
+    ingredient_id: Optional[str] = None
+    provenance: str  # db_match | alias_match | unknown | ai_enriched
+    safety_delta: int = 0          # negative numbers reduce safety score
+    hormone_delta: int = 0         # positive numbers increase hormone score
+    rule_ids: List[str] = Field(default_factory=list)
+    notes: Optional[str] = None
+
+
+class ScoreResult(BaseModel):
+    schema_version: str = Field("score_result_v0")
+    event_id: str
+    barcode: str
+    product_name: Optional[str] = None
+    brand: Optional[str] = None
+
+    safety_score: int
+    hormone_score: int
+
+    contributions: List[IngredientScoreContribution] = Field(default_factory=list)
+    notes: Optional[str] = None

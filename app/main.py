@@ -12,7 +12,7 @@ from app.domain.schemas import (
     IngestResponse,
     Event,
     BarcodeScanIngestRequest,
-    OpsEventActionRequest,  # ✅ generic ops request
+    OpsEventActionRequest,
     Decision,
 )
 from app.services.router import route_event
@@ -21,12 +21,10 @@ from app.services.actuator import execute_decision
 app = FastAPI(title="AI Control Plane")
 logger = get_logger()
 
-# Persistent idempotency store (survives restarts)
 idem_store = SQLiteIdempotencyStore()
 
 
 def _process_ingest(ingest_req: IngestRequest, idempotency_key: Optional[str]) -> IngestResponse:
-    # Gate 1: Idempotency-Key is required
     if not idempotency_key:
         log_event(
             logger,
@@ -39,7 +37,6 @@ def _process_ingest(ingest_req: IngestRequest, idempotency_key: Optional[str]) -
         )
         raise HTTPException(status_code=400, detail="Missing Idempotency-Key header")
 
-    # Gate 2: Reuse existing Event if this key was already processed (persistent)
     existing_event = idem_store.get(idempotency_key)
     if existing_event:
         log_event(
@@ -95,7 +92,6 @@ def _process_ingest(ingest_req: IngestRequest, idempotency_key: Optional[str]) -
 
         return IngestResponse(event=existing_event, decision=decision)
 
-    # New Event
     event = Event(
         event_id=str(uuid.uuid4()),
         event_type=ingest_req.event_type,
@@ -117,10 +113,8 @@ def _process_ingest(ingest_req: IngestRequest, idempotency_key: Optional[str]) -
         },
     )
 
-    # Persist Event for idempotency
     idem_store.set(idempotency_key, event)
 
-    # Decide
     decision = route_event(event)
     log_event(
         logger,
@@ -134,7 +128,6 @@ def _process_ingest(ingest_req: IngestRequest, idempotency_key: Optional[str]) -
         },
     )
 
-    # Act
     try:
         action_result = execute_decision(event, decision)
         log_event(
@@ -188,14 +181,6 @@ def ingest_barcode_scan(
     req: BarcodeScanIngestRequest,
     idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
 ) -> IngestResponse:
-    """
-    Mobile barcode scan ingest.
-
-    Idempotency (frontend-aware):
-    - Prefer Idempotency-Key header if client provides it
-    - Else derive stable key from (device_id + scan_session_id + barcode)
-    - Else reject
-    """
     effective_key = idempotency_key
     if not effective_key:
         if req.device_id and req.scan_session_id:
@@ -229,24 +214,12 @@ def ops_barcode_enrich_ai(
     req: OpsEventActionRequest,
     _: None = Depends(require_ops_api_key),
 ):
-    """
-    Operator-triggered Tier-2 enrichment phase.
-
-    Uses stored Event (via idempotency_key) and executes:
-      route = ENRICH_UNKNOWN_INGREDIENTS_AI
-    """
     existing_event = idem_store.get(req.idempotency_key)
     if not existing_event:
-        raise HTTPException(
-            status_code=404,
-            detail="Event not found for idempotency_key. Ingest must happen first.",
-        )
+        raise HTTPException(status_code=404, detail="Event not found for idempotency_key. Ingest must happen first.")
 
     if existing_event.source != "barcode_scan":
-        raise HTTPException(
-            status_code=400,
-            detail="AI enrichment supported only for barcode_scan events.",
-        )
+        raise HTTPException(status_code=400, detail="AI enrichment supported only for barcode_scan events.")
 
     decision = Decision(
         decision_id=str(uuid.uuid4()),
@@ -257,27 +230,40 @@ def ops_barcode_enrich_ai(
         proposed_action={},
     )
 
-    log_event(
-        logger,
-        event_name="ops_ai_enrichment_requested",
-        fields={
-            "idempotency_key": req.idempotency_key,
-            "event_id": existing_event.event_id,
-            "mode": req.mode,
-        },
-    )
-
+    log_event(logger, "ops_ai_enrichment_requested", {"idempotency_key": req.idempotency_key, "event_id": existing_event.event_id, "mode": req.mode})
     action_result = execute_decision(existing_event, decision)
+    log_event(logger, "ops_ai_enrichment_completed", {"idempotency_key": req.idempotency_key, "event_id": existing_event.event_id, "status": action_result.status, "artifact_path": action_result.artifact_path})
 
-    log_event(
-        logger,
-        event_name="ops_ai_enrichment_completed",
-        fields={
-            "idempotency_key": req.idempotency_key,
-            "event_id": existing_event.event_id,
-            "status": action_result.status,
-            "artifact_path": action_result.artifact_path,
-        },
+    return {"event_id": existing_event.event_id, "action_result": action_result.model_dump()}
+
+
+@app.post("/ops/barcode/score")
+def ops_barcode_score(
+    req: OpsEventActionRequest,
+    _: None = Depends(require_ops_api_key),
+):
+    """
+    Operator-triggered deterministic scoring phase.
+    Reads normalization + (optional) enrichment artifacts and writes score_result artifact.
+    """
+    existing_event = idem_store.get(req.idempotency_key)
+    if not existing_event:
+        raise HTTPException(status_code=404, detail="Event not found for idempotency_key. Ingest must happen first.")
+
+    if existing_event.source != "barcode_scan":
+        raise HTTPException(status_code=400, detail="Scoring supported only for barcode_scan events.")
+
+    decision = Decision(
+        decision_id=str(uuid.uuid4()),
+        event_id=existing_event.event_id,
+        route="SCORE_PRODUCT",
+        reason="Operator triggered deterministic scoring",
+        risk_level="low",
+        proposed_action={},
     )
+
+    log_event(logger, "ops_score_requested", {"idempotency_key": req.idempotency_key, "event_id": existing_event.event_id, "mode": req.mode})
+    action_result = execute_decision(existing_event, decision)
+    log_event(logger, "ops_score_completed", {"idempotency_key": req.idempotency_key, "event_id": existing_event.event_id, "status": action_result.status, "artifact_path": action_result.artifact_path})
 
     return {"event_id": existing_event.event_id, "action_result": action_result.model_dump()}
