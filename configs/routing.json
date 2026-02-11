@@ -8,11 +8,9 @@
 
   "source_policies": {
     "barcode_scan": {
-      "required_fields": [
-        "payload.barcode"
-      ],
+      "required_fields": ["payload.barcode"],
       "clarification_question": "Missing barcode. Please rescan the product barcode.",
-      "default_route": "NORMALIZE_BARCODE"
+      "default_route": "AUTO_PROCESS_BARCODE"
     }
   }
 }

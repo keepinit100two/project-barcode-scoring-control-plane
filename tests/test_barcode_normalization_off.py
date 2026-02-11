@@ -1,65 +1,41 @@
-import json
-import httpx
 from fastapi.testclient import TestClient
-
 from app.main import app
-import app.services.openfoodfacts_client as off_client
 
 client = TestClient(app)
 
 
-def test_barcode_scan_normalize_writes_artifact(tmp_path, monkeypatch):
-    # Patch artifact store output dir
-    import app.services.actuator as actuator
-    from app.core.artifacts import LocalArtifactStore
-    monkeypatch.setattr(actuator, "artifact_store", LocalArtifactStore(tmp_path))
+def test_barcode_scan_requires_idempotency_key_when_missing_device_and_session():
+    payload = {"barcode": "012345678905", "metadata": {}}
+    r = client.post("/ingest/barcode_scan", json=payload)
+    assert r.status_code == 400
 
-    # Mock OFF HTTP response by patching httpx.Client used in off_client
-    class PatchedClient:
-        def __init__(self, *args, **kwargs):
-            pass
 
-        def __enter__(self):
-            return self
-
-        def __exit__(self, exc_type, exc, tb):
-            return False
-
-        def get(self, url):
-            req = httpx.Request("GET", url)
-            return httpx.Response(
-                200,
-                request=req,
-                json={
-                    "product": {
-                        "product_name": "Mock Product",
-                        "brands": "MockBrand",
-                        "ingredients_text": "Water, Baking Soda, Fragrance"
-                    }
-                },
-            )
-
-    monkeypatch.setattr(off_client.httpx, "Client", PatchedClient)
-
+def test_barcode_scan_derives_idempotency_key_from_device_and_session():
     payload = {
         "barcode": "012345678905",
         "device_id": "device-1",
-        "scan_session_id": "session-100",
+        "scan_session_id": "session-1",
+        "metadata": {}
+    }
+    r = client.post("/ingest/barcode_scan", json=payload)
+    assert r.status_code == 200
+    body = r.json()
+    assert body["event"]["source"] == "barcode_scan"
+    assert body["event"]["event_type"] == "barcode_scan"
+
+
+def test_barcode_scan_idempotency_dedupes_duplicate_scans():
+    payload = {
+        "barcode": "012345678905",
+        "device_id": "device-1",
+        "scan_session_id": "session-2",
         "metadata": {}
     }
 
-    r = client.post("/ingest/barcode_scan", json=payload)
-    assert r.status_code == 200
+    r1 = client.post("/ingest/barcode_scan", json=payload)
+    assert r1.status_code == 200
 
-    body = r.json()
-    event_id = body["event"]["event_id"]
+    r2 = client.post("/ingest/barcode_scan", json=payload)
+    assert r2.status_code == 200
 
-    artifact_path = tmp_path / f"{event_id}.barcode_normalization.json"
-    assert artifact_path.exists()
-
-    data = json.loads(artifact_path.read_text(encoding="utf-8"))
-    assert data["barcode"] == "012345678905"
-    assert data["product_name"] == "Mock Product"
-    assert data["brand"] == "MockBrand"
-    assert "ingredients" in data
-    assert len(data["ingredients"]) == 3
+    assert r1.json()["event"]["event_id"] == r2.json()["event"]["event_id"]

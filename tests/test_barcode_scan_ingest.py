@@ -5,10 +5,7 @@ client = TestClient(app)
 
 
 def test_barcode_scan_requires_idempotency_key_when_missing_device_and_session():
-    payload = {
-        "barcode": "012345678905",
-        "metadata": {}
-    }
+    payload = {"barcode": "012345678905", "metadata": {}}
     r = client.post("/ingest/barcode_scan", json=payload)
     assert r.status_code == 400
 
@@ -40,5 +37,5 @@ def test_barcode_scan_idempotency_dedupes_duplicate_scans():
 
     r2 = client.post("/ingest/barcode_scan", json=payload)
     assert r2.status_code == 200
-    # On duplicate, event_id should be identical because persistent idempotency store returns the same event
+
     assert r1.json()["event"]["event_id"] == r2.json()["event"]["event_id"]
